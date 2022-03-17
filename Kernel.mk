@@ -25,6 +25,7 @@ OBJS		:=	src/config.o \
 				src/net/ftpdaemon.o \
 				src/net/ftpworker.o \
 				src/net/udpmidi.o \
+				src/net/luarepl.o \
 				src/pisound.o \
 				src/power.o \
 				src/rommanager.o \
@@ -83,6 +84,9 @@ EXTRALIBS	+=	$(MT32EMULIB)
 INCLUDE		+=	-I $(FLUIDSYNTHBUILDDIR)/include \
 				-I $(FLUIDSYNTHHOME)/include
 EXTRALIBS	+=	$(FLUIDSYNTHLIB)
+
+INCLUDE		+=	-I $(LUAHOME)
+EXTRALIBS	+=	$(LUALIB)
 
 #
 # Generate version string from git tag
