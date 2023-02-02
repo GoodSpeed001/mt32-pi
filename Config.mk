@@ -8,7 +8,7 @@ AARCH64_HOME?=$(HOME)/arm-gnu-toolchain-11.3.rel1-x86_64-aarch64-none-elf
 
 # Valid options: pi3, pi3-64, pi4, pi4-64
 BOARD?=pi3-64
-HDMI_CONSOLE?=0
+HDMI_CONSOLE?=1
 
 # Serial bootloader config
 SERIALPORT?=/dev/ttyUSB0

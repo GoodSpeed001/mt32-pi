@@ -23,14 +23,15 @@
 #include <circle/logger.h>
 #include <circle/timer.h>
 #include <circle/util.h>
+#include <circle/sched/scheduler.h>
 
 #include <cstdio>
 
 #include "pisound.h"
 
 constexpr u8 SPIChipSelect        = 0;
-constexpr u8 SPIDelayMicroseconds = 10;
-constexpr u32 SPIClockSpeed       = 150000;
+// FIXME: Linux driver works at 150000Hz, but here we get data corruption hence lower clock speed - investigate
+constexpr u32 SPIClockSpeed       = 15000;
 constexpr u8 SPITransferSize      = 4;
 
 constexpr u8 GPIOButton = 17;
@@ -48,8 +49,10 @@ const char PisoundName[] = "pisound";
 // Based on: https://github.com/raspberrypi/linux/blob/rpi-5.4.y/sound/soc/bcm/pisound.c
 //           https://github.com/raspberrypi/linux/blob/rpi-5.4.y/arch/arm/boot/dts/overlays/pisound-overlay.dts
 
-CPisound::CPisound(CSPIMaster* pSPIMaster, CGPIOManager* pGPIOManager, unsigned nSamplerate)
-	: m_pSPIMaster(pSPIMaster),
+CPisound::CPisound(CSPIMasterDMA* pSPIMaster, CGPIOManager* pGPIOManager, unsigned nSamplerate)
+	: CTask(TASK_STACK_SIZE, true),
+	  m_Lock(IRQ_LEVEL),
+	  m_pSPIMaster(pSPIMaster),
 	  m_nSamplerate(nSamplerate),
 
 	  m_SPIReset(GPIOSPIReset, TGPIOMode::GPIOModeOutput),
@@ -80,6 +83,8 @@ CPisound::~CPisound()
 	m_OversamplingRatio0.SetMode(TGPIOMode::GPIOModeInputPullDown);
 	m_OversamplingRatio1.SetMode(TGPIOMode::GPIOModeInputPullDown);
 	m_OversamplingRatio2.SetMode(TGPIOMode::GPIOModeInputPullDown);
+
+	Terminate();
 }
 
 bool CPisound::Initialize()
@@ -108,7 +113,6 @@ bool CPisound::Initialize()
 	}
 
 	// Setup SPI
-	m_pSPIMaster->SetCSHoldTime(SPIDelayMicroseconds);
 	m_pSPIMaster->SetClock(SPIClockSpeed);
 
 	// Reset the SPI device
@@ -133,15 +137,18 @@ bool CPisound::Initialize()
 	pLogger->Write(PisoundName, LogNotice, "Firmware version: %s", m_FirmwareVersion);
 	pLogger->Write(PisoundName, LogNotice, "Hardware version: %s", m_HardwareVersion);
 
+	Start();
+
 	return true;
 }
 
 size_t CPisound::SendMIDI(const u8* pData, size_t nSize)
 {
-	// TODO
-	m_MIDITxBuffer.Enqueue(pData, nSize);
-	SPITask();
-	return nSize;
+	// Wake up task
+	if (IsSuspended())
+		Resume();
+
+	return m_MIDITxBuffer.Enqueue(pData, nSize);
 }
 
 u16 CPisound::Transfer16(u16 nTxValue) const
@@ -151,7 +158,7 @@ u16 CPisound::Transfer16(u16 nTxValue) const
 	SPITxBuffer[0] = nTxValue >> 8;
 	SPITxBuffer[1] = nTxValue & 0xFF;
 
-	if (m_pSPIMaster->WriteRead(SPIChipSelect, SPITxBuffer, SPIRxBuffer, sizeof(SPIRxBuffer)) < 0)
+	if (m_pSPIMaster->WriteReadSync(SPIChipSelect, SPITxBuffer, SPIRxBuffer, sizeof(SPIRxBuffer)) < 0)
 		return 0;
 
 	return (SPIRxBuffer[0] << 8) | SPIRxBuffer[1];
@@ -248,11 +255,17 @@ void CPisound::SetOSRPins(unsigned bRatio1, unsigned bRatio2, unsigned bRatio3)
 void CPisound::DataAvailableInterruptHandler(void* pUserData)
 {
 	CPisound* pThis = static_cast<CPisound*>(pUserData);
-	pThis->SPITask();
+	if (pThis->IsSuspended())
+		pThis->Resume();
 }
 
-void CPisound::SPITask()
+void CPisound::DoTransfer()
 {
+	CLogger* const pLogger = CLogger::Get();
+	bool bHadData = false;
+
+	m_Lock.Acquire();
+
 	do
 	{
 		size_t nMIDIRxBytes = 0;
@@ -262,6 +275,8 @@ void CPisound::SPITask()
 
 		u8 SPIRxBuffer[SPITransferSize];
 		u8 SPITxBuffer[SPITransferSize];
+
+		bHadData = false;
 		memset(SPIRxBuffer, 0, sizeof(SPIRxBuffer));
 		memset(SPITxBuffer, 0, sizeof(SPITxBuffer));
 
@@ -274,15 +289,39 @@ void CPisound::SPITask()
 		}
 
 		// Extract incoming MIDI bytes from SPI packet
-		m_pSPIMaster->WriteRead(SPIChipSelect, SPITxBuffer, SPIRxBuffer, sizeof(SPIRxBuffer));
-		for (size_t i = 0; i < sizeof(SPIRxBuffer); i += 2)
+		if (m_pSPIMaster->WriteReadSync(SPIChipSelect, SPITxBuffer, SPIRxBuffer, SPITransferSize) != SPITransferSize)
+		{
+			pLogger->Write(PisoundName, LogError, "SPI transfer failed");
+			continue;
+		}
+
+		for (size_t i = 0; i < SPITransferSize; i += 2)
 		{
 			if (SPIRxBuffer[i])
+			{
 				MIDIRxBuffer[nMIDIRxBytes++] = SPIRxBuffer[i + 1];
+				bHadData = true;
+			}
 		}
 
 		// Pass MIDI bytes on to handler
 		if (nMIDIRxBytes && m_pReceiveHandler)
 			m_pReceiveHandler(MIDIRxBuffer, nMIDIRxBytes);
-	} while (m_DataAvailable.Read() == HIGH || !m_MIDITxBuffer.IsEmpty());
+	} while (bHadData || !m_MIDITxBuffer.IsEmpty() || m_DataAvailable.Read() == HIGH);
+
+	m_Lock.Release();
+}
+
+void CPisound::Run()
+{
+	CScheduler* const pScheduler = CScheduler::Get();
+
+	while (true)
+	{
+		DoTransfer();
+		Suspend();
+
+		// Allow other tasks to run
+		pScheduler->Yield();
+	}
 }
